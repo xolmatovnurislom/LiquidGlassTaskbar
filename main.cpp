@@ -1,6 +1,6 @@
 // ============================================================================
 //  Liquid Glass Taskbar — Single-file implementation
-//  D3D11 + HLSL + DirectComposition + Desktop Duplication
+//  D3D11 + HLSL + DirectComposition + Desktop Duplication + ON/OFF Window
 // ============================================================================
 
 #include <windows.h>
@@ -286,7 +286,7 @@ bool GlassEngine::Init(HWND hwnd, int winX, int winY, int winW, int winH,
     if (!CreateDeviceAndSwapchain()) return false;
     if (!CreateShaders())            return false;
     if (!CreateBlurChain())          return false;
-    CreateDuplication();  // best-effort
+    CreateDuplication();
     return true;
 }
 
@@ -516,7 +516,6 @@ void GlassEngine::RenderBlurChain()
     POINT zero{ 0, 0 };
     ctx_->PSSetSamplers(0, 1, samp_.GetAddressOf());
 
-    // Extract from full-screen texture
     {
         ID3D11RenderTargetView* r = down_[0].rtv.Get();
         ctx_->OMSetRenderTargets(1, &r, nullptr);
@@ -525,7 +524,6 @@ void GlassEngine::RenderBlurChain()
         UpdateCB(dummy, zero, 1.0f / scrW_, 1.0f / scrH_, 0.0f, 0.0f);
         DrawFullscreen();
     }
-    // Down chain
     for (int i = 0; i < kBlurLevels; i++) {
         ID3D11RenderTargetView* r = down_[i + 1].rtv.Get();
         ctx_->OMSetRenderTargets(1, &r, nullptr);
@@ -534,7 +532,6 @@ void GlassEngine::RenderBlurChain()
         UpdateCB(dummy, zero, 1.0f / down_[i].w, 1.0f / down_[i].h, 1.0f, 1.0f);
         DrawFullscreen();
     }
-    // Up chain
     for (int i = 0; i < kBlurLevels; i++) {
         int srcIdx = kBlurLevels - i;
         ID3D11RenderTargetView* r = up_[i].rtv.Get();
@@ -577,7 +574,7 @@ bool GlassEngine::RenderFrame(const GlassParams& p, POINT cur)
     if (gotNew) RenderBlurChain();
 
     if (!capValid_) return false;
-    if (!gotNew && !mouseMoved && presentedOnce_) return false;  // fully idle
+    if (!gotNew && !mouseMoved && presentedOnce_) return false;
 
     RenderComposite(p, cur);
     Present();
@@ -741,6 +738,8 @@ bool TaskbarManager::IsFullscreenAppActive()
 //  TRAY ICON
 // ============================================================================
 enum class TrayCmd {
+    OpenWindow = 1000,
+    ToggleOnOff = 1005,
     StylePill = 1001, StyleFullWidth = 1002,
     MatClear = 1010, MatFrost = 1011, MatObsidian = 1012,
     ToggleGlint = 1020, Autostart = 1030, Quit = 1040
@@ -750,7 +749,7 @@ class TrayIcon {
 public:
     bool Install(HWND hwnd, UINT wmApp);
     void Remove();
-    void ShowMenu(POINT pt);
+    void ShowMenu(bool effectEnabled);
 private:
     HWND  hwnd_ = nullptr;
     UINT  wmApp_ = 0;
@@ -772,9 +771,14 @@ bool TrayIcon::Install(HWND hwnd, UINT wmApp)
 
 void TrayIcon::Remove() { Shell_NotifyIconW(NIM_DELETE, &nid_); }
 
-void TrayIcon::ShowMenu(POINT)
+void TrayIcon::ShowMenu(bool effectEnabled)
 {
     HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, (UINT_PTR)TrayCmd::OpenWindow, L"Open Control Window");
+    AppendMenuW(m, MF_STRING, (UINT_PTR)TrayCmd::ToggleOnOff,
+                effectEnabled ? L"Turn OFF Effect" : L"Turn ON Effect");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+
     HMENU style = CreatePopupMenu();
     AppendMenuW(style, MF_STRING, (UINT_PTR)TrayCmd::StylePill,     L"Floating Pill (Apple Dock)");
     AppendMenuW(style, MF_STRING, (UINT_PTR)TrayCmd::StyleFullWidth, L"Full-Width Capsule");
@@ -800,17 +804,24 @@ void TrayIcon::ShowMenu(POINT)
 }
 
 // ============================================================================
-//  APP STATE + MAIN
+//  APP STATE + CONTROL WINDOW + MAIN
 // ============================================================================
 static const wchar_t* kClassName = L"LiquidGlassTaskbarWnd";
+static const wchar_t* kCtrlClassName = L"LiquidGlassControlWnd";
 static const UINT WM_TRAY = WM_APP + 1;
+static constexpr UINT ID_BTN_TOGGLE = 2001;
 
 struct AppState {
     HWND hwnd = nullptr;
+    HWND hwndCtrl = nullptr;
+    HWND hwndBtnToggle = nullptr;
+    HWND hwndStatusLabel = nullptr;
+    HINSTANCE hInst = nullptr;
     std::unique_ptr<GlassEngine> engine;
     TaskbarManager taskbar;
     TrayIcon tray;
     GlassParams params;
+    bool effectEnabled = true;
     bool fullWidth = false;
     bool glintOn = true;
     int  scrW = 0, scrH = 0;
@@ -818,6 +829,101 @@ struct AppState {
     int  gOX = 0, gOY = 0, gW = 0, gH = 0;
 };
 static AppState g;
+
+static void UpdateControlUI()
+{
+    if (g.hwndBtnToggle && IsWindow(g.hwndBtnToggle)) {
+        SetWindowTextW(g.hwndBtnToggle, g.effectEnabled ? L"TURN OFF" : L"TURN ON");
+    }
+    if (g.hwndStatusLabel && IsWindow(g.hwndStatusLabel)) {
+        SetWindowTextW(g.hwndStatusLabel,
+                       g.effectEnabled ? L"Effect Status: ON" : L"Effect Status: OFF");
+    }
+}
+
+static void SetEffectEnabled(bool enabled)
+{
+    g.effectEnabled = enabled;
+    if (g.hwnd && IsWindow(g.hwnd)) {
+        ShowWindow(g.hwnd, g.effectEnabled ? SW_SHOWNA : SW_HIDE);
+    }
+    if (g.effectEnabled) {
+        g.taskbar.Install();
+    } else {
+        g.taskbar.Restore();
+    }
+    UpdateControlUI();
+}
+
+static LRESULT CALLBACK CtrlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+        g.hwndStatusLabel = CreateWindowExW(
+            0, L"STATIC", L"Effect Status: ON",
+            WS_CHILD | WS_VISIBLE | SS_CENTER,
+            20, 22, 260, 24,
+            hwnd, nullptr, g.hInst, nullptr);
+        SendMessageW(g.hwndStatusLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        g.hwndBtnToggle = CreateWindowExW(
+            0, L"BUTTON", L"TURN OFF",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            75, 62, 150, 40,
+            hwnd, (HMENU)ID_BTN_TOGGLE, g.hInst, nullptr);
+        SendMessageW(g.hwndBtnToggle, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        UpdateControlUI();
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wp) == ID_BTN_TOGGLE) {
+            SetEffectEnabled(!g.effectEnabled);
+        }
+        return 0;
+
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ShowControlWindow()
+{
+    if (g.hwndCtrl && IsWindow(g.hwndCtrl)) {
+        ShowWindow(g.hwndCtrl, SW_SHOWNORMAL);
+        SetForegroundWindow(g.hwndCtrl);
+        UpdateControlUI();
+        return;
+    }
+
+    WNDCLASSEXW wc{ sizeof(wc) };
+    wc.lpfnWndProc = CtrlWndProc;
+    wc.hInstance = g.hInst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = kCtrlClassName;
+    RegisterClassExW(&wc);
+
+    int w = 315, h = 165;
+    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
+    int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+
+    g.hwndCtrl = CreateWindowExW(
+        WS_EX_TOPMOST,
+        kCtrlClassName,
+        L"Liquid Glass Control",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        x, y, w, h,
+        nullptr, nullptr, g.hInst, nullptr);
+
+    ShowWindow(g.hwndCtrl, SW_SHOW);
+    UpdateWindow(g.hwndCtrl);
+}
 
 static bool GetPrimaryTaskbarRect(RECT& r)
 {
@@ -840,7 +946,7 @@ static void ComputeGeometry()
     int marginH = g.fullWidth ? 0 : 12;
     int marginT = 6;
     int marginB = 6;
-    int extra   = 4;   // shadow pad above taskbar
+    int extra   = 4;
 
     g.winX = tb.left;
     g.winY = tb.top - extra;
@@ -875,31 +981,40 @@ static void ToggleAutostart(bool on)
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == g.taskbar.TaskbarCreatedMessage() && msg != 0) {
-        g.taskbar.Reapply();
+        if (g.effectEnabled) g.taskbar.Reapply();
         ComputeGeometry();
         SetWindowPos(hwnd, HWND_TOPMOST, g.winX, g.winY, g.winW, g.winH,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                     SWP_NOACTIVATE | (g.effectEnabled ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
         return 0;
     }
     switch (msg) {
     case WM_TRAY:
-        if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_LBUTTONUP)
-            g.tray.ShowMenu(POINT{});
+        if (LOWORD(lp) == WM_RBUTTONUP) {
+            g.tray.ShowMenu(g.effectEnabled);
+        } else if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) {
+            ShowControlWindow();
+        }
         return 0;
 
     case WM_COMMAND:
-        switch (wp) {
+        switch (LOWORD(wp)) {
+        case (UINT)TrayCmd::OpenWindow:
+            ShowControlWindow();
+            return 0;
+        case (UINT)TrayCmd::ToggleOnOff:
+            SetEffectEnabled(!g.effectEnabled);
+            return 0;
         case (UINT)TrayCmd::StylePill:
             g.fullWidth = false;
             ComputeGeometry();
             SetWindowPos(hwnd, HWND_TOPMOST, g.winX, g.winY, g.winW, g.winH,
-                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                         SWP_NOACTIVATE | (g.effectEnabled ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
             return 0;
         case (UINT)TrayCmd::StyleFullWidth:
             g.fullWidth = true;
             ComputeGeometry();
             SetWindowPos(hwnd, HWND_TOPMOST, g.winX, g.winY, g.winW, g.winH,
-                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                         SWP_NOACTIVATE | (g.effectEnabled ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
             return 0;
         case (UINT)TrayCmd::MatClear:    g.params.material = 0.0f; return 0;
         case (UINT)TrayCmd::MatFrost:    g.params.material = 1.0f; return 0;
@@ -917,7 +1032,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DPICHANGED:
         ComputeGeometry();
         SetWindowPos(hwnd, HWND_TOPMOST, g.winX, g.winY, g.winW, g.winH,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                     SWP_NOACTIVATE | (g.effectEnabled ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
         return 0;
 
     case WM_CLOSE:  PostQuitMessage(0); return 0;
@@ -928,6 +1043,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 {
+    g.hInst = hInst;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     WNDCLASSEXW wc{ sizeof(wc) };
@@ -956,45 +1072,30 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     }
 
     g.taskbar.Install();
-    g.taskbar.Reapply();
     g.tray.Install(g.hwnd, WM_TRAY);
-    g.params.specular = g.glintOn ? 1.0f : 0.0f;
+    ShowWindow(g.hwnd, SW_SHOWNA);
+    ShowControlWindow();
 
-    ShowWindow(g.hwnd, SW_SHOWNOACTIVATE);
-
-    LARGE_INTEGER freq, last;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&last);
-
-    bool running = true;
     MSG msg{};
-    while (running) {
+    while (true) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) { running = false; break; }
+            if (msg.message == WM_QUIT) {
+                g.tray.Remove();
+                g.taskbar.Restore();
+                if (g.engine) g.engine->Shutdown();
+                return (int)msg.wParam;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if (!running) break;
 
-        if (TaskbarManager::IsFullscreenAppActive()) {
-            ShowWindow(g.hwnd, SW_HIDE);
-            Sleep(180);
-            continue;
+        if (g.effectEnabled && !TaskbarManager::IsFullscreenAppActive()) {
+            POINT cur{};
+            GetCursorPos(&cur);
+            g.engine->RenderFrame(g.params, cur);
+        } else {
+            Sleep(30);
         }
-        if (!IsWindowVisible(g.hwnd))
-            ShowWindow(g.hwnd, SW_SHOWNOACTIVATE);
-
-        POINT cur; GetCursorPos(&cur);
-        g.engine->RenderFrame(g.params, cur);
-
-        LARGE_INTEGER now; QueryPerformanceCounter(&now);
-        float dt = (float)(now.QuadPart - last.QuadPart) / (float)freq.QuadPart;
-        last = now;
-        if (dt < 0.016f) Sleep(1);
+        Sleep(10);
     }
-
-    g.tray.Remove();
-    g.taskbar.Restore();
-    g.engine->Shutdown();
-    return 0;
 }
