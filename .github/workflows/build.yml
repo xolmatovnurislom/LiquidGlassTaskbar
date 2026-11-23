@@ -18,11 +18,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Visual Studio environment
-        uses: ilamovski/setup-vs@v1
-
       - name: Configure CMake
-        run: cmake -B build -A x64
+        run: cmake -B build
 
       - name: Build Release EXE
         run: cmake --build build --config Release
@@ -31,7 +28,7 @@ jobs:
         id: locate_exe
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path "build\Release" -Filter "*.exe" -Recurse | Select-Object -First 1
+          $exe = Get-ChildItem -Path "build" -Filter "*.exe" -Recurse | Select-Object -First 1
           if (-not $exe) {
             Write-Error "EXE file not found in build"
             exit 1
