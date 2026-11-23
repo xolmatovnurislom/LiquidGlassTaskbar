@@ -1,6 +1,6 @@
 // ============================================================================
 //  Liquid Glass Taskbar — Single-file implementation
-//  D3D11 + HLSL + DirectComposition + Desktop Duplication + ON/OFF Window
+//  D3D11 + HLSL + DirectComposition + Desktop Duplication + Fallback Capture
 // ============================================================================
 
 #include <windows.h>
@@ -134,7 +134,7 @@ float4 PS_Composite(VSOut i) : SV_Target
     float2 sampleUV = i.uv;
     if (d > -RIM_BAND)
     {
-        float bendPx = edgeFactor * edgeFactor * 7.0 * g_RefractStrength;
+        float bendPx = edgeFactor * edgeFactor * 8.0 * g_RefractStrength;
         sampleUV += n * bendPx / g_WindowSize;
     }
 
@@ -154,21 +154,21 @@ float4 PS_Composite(VSOut i) : SV_Target
 
     float3 tintMul;
     float  tintAmt;
-    if      (g_Material < 0.5) { tintMul = lerp(float3(1.04,1.04,1.08), float3(0.88,0.88,0.93), lum); tintAmt = 0.18; }
-    else if (g_Material < 1.5) { tintMul = lerp(float3(1.08,1.08,1.12), float3(0.80,0.80,0.86), lum); tintAmt = 0.42; }
-    else                       { tintMul = lerp(float3(0.60,0.60,0.72), float3(0.18,0.18,0.28), lum); tintAmt = 0.72; }
+    if      (g_Material < 0.5) { tintMul = lerp(float3(1.05,1.05,1.10), float3(0.88,0.88,0.95), lum); tintAmt = 0.22; }
+    else if (g_Material < 1.5) { tintMul = lerp(float3(1.10,1.10,1.15), float3(0.78,0.78,0.86), lum); tintAmt = 0.45; }
+    else                       { tintMul = lerp(float3(0.58,0.58,0.72), float3(0.16,0.16,0.26), lum); tintAmt = 0.72; }
     bg.rgb = lerp(bg.rgb, bg.rgb * tintMul, tintAmt);
 
     if (g_Specular > 0.01)
     {
         float insideDist = -d;
-        float rimW  = 2.0;
+        float rimW  = 2.2;
         float rim   = saturate(1.0 - abs(insideDist - rimW * 0.5) / (rimW * 0.5));
-        float topB  = saturate((-p.y) / halfGlass.y + 0.35);
+        float topB  = saturate((-p.y) / halfGlass.y + 0.40);
         float mDist = length(glassPx - g_MousePos);
         float mStr  = saturate(1.0 - mDist / 420.0);
-        float spec  = rim * topB * max(0.12, mStr * 0.9) * g_Specular;
-        bg.rgb += spec * 0.55;
+        float spec  = rim * topB * max(0.18, mStr * 0.95) * g_Specular;
+        bg.rgb += spec * 0.65;
     }
 
     if (g_Noise > 0.0)
@@ -207,7 +207,7 @@ struct CBData {
 };
 
 // ============================================================================
-//  GLASS ENGINE
+//  GLASS ENGINE (DXGI Desktop Duplication + GDI BitBlt Fallback)
 // ============================================================================
 class GlassEngine {
 public:
@@ -222,6 +222,7 @@ private:
     bool CreateBlurChain();
     bool CreateDuplication();
     bool AcquireAndCopyFrame();
+    bool CaptureViaGdiFallback();
     void RenderBlurChain();
     void RenderComposite(const GlassParams&, POINT);
     void UpdateCB(const GlassParams&, POINT,
@@ -248,6 +249,8 @@ private:
     ComPtr<ID3D11Texture2D>        capTex_;
     ComPtr<ID3D11ShaderResourceView> capSrv_;
     bool capValid_ = false;
+    bool useGdiFallback_ = false;
+    ULONGLONG lastGdiTick_ = 0;
 
     struct Tex {
         ComPtr<ID3D11Texture2D>          tex;
@@ -286,7 +289,23 @@ bool GlassEngine::Init(HWND hwnd, int winX, int winY, int winW, int winH,
     if (!CreateDeviceAndSwapchain()) return false;
     if (!CreateShaders())            return false;
     if (!CreateBlurChain())          return false;
-    CreateDuplication();
+
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = (UINT)(scrW_ > 0 ? scrW_ : 1920);
+    d.Height = (UINT)(scrH_ > 0 ? scrH_ : 1080);
+    d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(dev_->CreateTexture2D(&d, nullptr, &capTex_))) {
+        dev_->CreateShaderResourceView(capTex_.Get(), nullptr, &capSrv_);
+    }
+
+    if (!CreateDuplication()) {
+        useGdiFallback_ = true;
+        CaptureViaGdiFallback();
+    }
     return true;
 }
 
@@ -428,7 +447,7 @@ bool GlassEngine::CreateBlurChain()
 
 bool GlassEngine::CreateDuplication()
 {
-    dup_.Reset(); capSrv_.Reset(); capTex_.Reset();
+    dup_.Reset();
     ComPtr<IDXGIDevice> dxgiDev;
     if (FAILED(dev_.As(&dxgiDev))) return false;
     ComPtr<IDXGIAdapter> ad;
@@ -438,38 +457,97 @@ bool GlassEngine::CreateDuplication()
     ComPtr<IDXGIOutput1> out1;
     if (FAILED(out.As(&out1))) return false;
     if (FAILED(out1->DuplicateOutput(dev_.Get(), &dup_))) return false;
-
-    D3D11_TEXTURE2D_DESC d{};
-    d.Width = (UINT)scrW_; d.Height = (UINT)scrH_;
-    d.MipLevels = 1; d.ArraySize = 1;
-    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    d.SampleDesc.Count = 1;
-    d.Usage = D3D11_USAGE_DEFAULT;
-    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    if (FAILED(dev_->CreateTexture2D(&d, nullptr, &capTex_))) return false;
-    if (FAILED(dev_->CreateShaderResourceView(capTex_.Get(), nullptr, &capSrv_)))
-        return false;
     return true;
+}
+
+bool GlassEngine::CaptureViaGdiFallback()
+{
+    if (!capTex_) return false;
+    int capW = winW_ > 0 ? winW_ : 1;
+    int capH = winH_ > 0 ? winH_ : 1;
+
+    HDC hdcScr = GetDC(nullptr);
+    if (!hdcScr) return false;
+    HDC hdcMem = CreateCompatibleDC(hdcScr);
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = capW;
+    bmi.bmiHeader.biHeight = -capH;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP hBmp = CreateDIBSection(hdcScr, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!hBmp || !bits) {
+        if (hBmp) DeleteObject(hBmp);
+        DeleteDC(hdcMem);
+        ReleaseDC(nullptr, hdcScr);
+        return false;
+    }
+
+    HGDIOBJ oldObj = SelectObject(hdcMem, hBmp);
+    BitBlt(hdcMem, 0, 0, capW, capH, hdcScr, winX_, winY_, SRCCOPY);
+
+    D3D11_BOX box{};
+    box.left = (UINT)(winX_ < 0 ? 0 : winX_);
+    box.top = (UINT)(winY_ < 0 ? 0 : winY_);
+    box.right = box.left + (UINT)capW;
+    box.bottom = box.top + (UINT)capH;
+    box.front = 0;
+    box.back = 1;
+
+    if (box.right <= (UINT)scrW_ && box.bottom <= (UINT)scrH_) {
+        ctx_->UpdateSubresource(capTex_.Get(), 0, &box, bits, (UINT)(capW * 4), 0);
+        capValid_ = true;
+    }
+
+    SelectObject(hdcMem, oldObj);
+    DeleteObject(hBmp);
+    DeleteDC(hdcMem);
+    ReleaseDC(nullptr, hdcScr);
+    return capValid_;
 }
 
 bool GlassEngine::AcquireAndCopyFrame()
 {
-    if (!dup_) { if (!CreateDuplication()) return false; }
-
-    DXGI_OUTDUPL_FRAME_INFO info{};
-    ComPtr<IDXGIResource> res;
-    HRESULT hr = dup_->AcquireNextFrame(0, &info, &res);
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
-    if (hr == DXGI_ERROR_ACCESS_LOST) { dup_.Reset(); CreateDuplication(); return false; }
-    if (FAILED(hr)) return false;
-
-    ComPtr<ID3D11Texture2D> src;
-    if (SUCCEEDED(res.As(&src))) {
-        ctx_->CopyResource(capTex_.Get(), src.Get());
-        capValid_ = true;
+    if (!useGdiFallback_) {
+        if (!dup_) {
+            if (!CreateDuplication()) {
+                useGdiFallback_ = true;
+            }
+        }
+        if (dup_ && !useGdiFallback_) {
+            DXGI_OUTDUPL_FRAME_INFO info{};
+            ComPtr<IDXGIResource> res;
+            HRESULT hr = dup_->AcquireNextFrame(0, &info, &res);
+            if (SUCCEEDED(hr)) {
+                ComPtr<ID3D11Texture2D> src;
+                if (SUCCEEDED(res.As(&src))) {
+                    ctx_->CopyResource(capTex_.Get(), src.Get());
+                    capValid_ = true;
+                }
+                dup_->ReleaseFrame();
+                return true;
+            }
+            if (hr == DXGI_ERROR_ACCESS_LOST) {
+                dup_.Reset();
+                if (!CreateDuplication()) useGdiFallback_ = true;
+            } else if (hr != DXGI_ERROR_WAIT_TIMEOUT) {
+                useGdiFallback_ = true;
+            }
+        }
     }
-    dup_->ReleaseFrame();
-    return true;
+
+    if (useGdiFallback_) {
+        ULONGLONG nowTick = GetTickCount64();
+        if (!capValid_ || (nowTick - lastGdiTick_) >= 66) {
+            lastGdiTick_ = nowTick;
+            return CaptureViaGdiFallback();
+        }
+    }
+    return false;
 }
 
 void GlassEngine::UpdateCB(const GlassParams& p, POINT cur,
@@ -677,8 +755,21 @@ void TaskbarManager::ApplyTransparencyToAll()
             savedCount_++;
         }
         ApplyTransparency(h);
-        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        EnumChildWindows(h, [](HWND child, LPARAM) -> BOOL {
+            auto f = GetSetWCA();
+            if (f) {
+                ACCENT_POLICY ap{};
+                ap.AccentState   = ACCENT_ENABLE_TRANSPARENTGRADIENT;
+                ap.AccentFlags   = 2;
+                ap.GradientColor = 0x00000000;
+                WINCOMPATTRDATA d{};
+                d.Attribute = 19;
+                d.pData = &ap;
+                d.cbData = sizeof(ap);
+                f(child, &d);
+            }
+            return TRUE;
+        }, 0);
     }
 }
 
@@ -688,7 +779,7 @@ void TaskbarManager::ApplyTransparency(HWND hwnd)
     if (!f) return;
     ACCENT_POLICY ap{};
     ap.AccentState   = ACCENT_ENABLE_TRANSPARENTGRADIENT;
-    ap.AccentFlags   = 0;
+    ap.AccentFlags   = 2;
     ap.GradientColor = 0x00000000;
     WINCOMPATTRDATA d{};
     d.Attribute = 19;
@@ -710,6 +801,19 @@ void TaskbarManager::RestoreWindow(HWND hwnd)
         d.cbData = sizeof(ap);
         f(hwnd, &d);
     }
+    EnumChildWindows(hwnd, [](HWND child, LPARAM) -> BOOL {
+        auto f = GetSetWCA();
+        if (f) {
+            ACCENT_POLICY ap{};
+            ap.AccentState = ACCENT_DISABLED;
+            WINCOMPATTRDATA d{};
+            d.Attribute = 19;
+            d.pData = &ap;
+            d.cbData = sizeof(ap);
+            f(child, &d);
+        }
+        return TRUE;
+    }, 0);
 }
 
 bool TaskbarManager::IsFullscreenAppActive()
