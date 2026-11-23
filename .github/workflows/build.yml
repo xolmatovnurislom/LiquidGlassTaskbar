@@ -18,11 +18,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup MSVC & CMake
-        uses: ilamovski/msibuild@v1
-        with:
-          msbuild-path: "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\MSBuild\\Current\\Bin\\MSBuild.exe"
-        continue-on-error: true
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
 
       - name: Configure CMake
         shell: cmd
