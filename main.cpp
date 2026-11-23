@@ -3,8 +3,6 @@
 //  D3D11 + HLSL + DirectComposition + Desktop Duplication
 // ============================================================================
 
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -501,7 +499,7 @@ void GlassEngine::UpdateCB(const GlassParams& p, POINT cur,
         memcpy(m.pData, &d, sizeof(d));
         ctx_->Unmap(cb_.Get(), 0);
     }
-    ctx_->PSSetConstantBuffers(0, 1, cb_.Get());
+    ctx_->PSSetConstantBuffers(0, 1, cb_.GetAddressOf());
 }
 
 void GlassEngine::DrawFullscreen()
@@ -516,7 +514,7 @@ void GlassEngine::RenderBlurChain()
 {
     GlassParams dummy;
     POINT zero{ 0, 0 };
-    ctx_->PSSetSamplers(0, 1, samp_.Get());
+    ctx_->PSSetSamplers(0, 1, samp_.GetAddressOf());
 
     // Extract from full-screen texture
     {
